@@ -2,8 +2,18 @@
 import requests
 import time
 import logging
-import threading # Added for lock
+import threading
 from typing import Optional, Dict, Any, Union, List, IO
+from contextlib import contextmanager
+from collections import defaultdict
+from .exceptions import (
+    HammerspaceApiError, AuthenticationError, AuthorizationError, 
+    ResourceNotFoundError, ValidationError, RateLimitError, ServerError,
+    ConnectionError, ConfigurationError, RetryExhaustedError
+)
+from .logging_config import MetricsCollector
+
+logger = logging.getLogger(__name__)
 
 from .ad import AdClient
 from .antivirus import AntivirusClient
@@ -32,7 +42,7 @@ from .license_server import LicenseServerClient
 from .licenses import LicensesClient
 from .logical_volumes import LogicalVolumesClient
 from .login_policy import LoginPolicyClient
-from .login import LoginClient # Crucial for login mechanism
+from .login import LoginClient
 from .mailsmtp import MailsmtpClient
 from .metrics import MetricsClient
 from .modeler import ModelerClient
@@ -60,7 +70,7 @@ from .sites import SitesClient
 from .snapshot_retentions import SnapshotRetentionsClient
 from .snmp import SnmpClient
 from .static_routes import StaticRoutesClient
-from .storage_volumes import StorageVolumesClient # File storage volumes
+from .storage_volumes import StorageVolumesClient
 from .subnet_gateways import SubnetGatewaysClient
 from .sw_update import SwUpdateClient
 from .syslog import SyslogClient
@@ -81,7 +91,13 @@ class HammerspaceApiClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         timeout: int = 60,
-        verify_ssl: bool = True
+        verify_ssl: bool = True,
+        max_retries: int = 3,
+        retry_backoff_factor: float = 0.5,
+        max_connections: int = 10,
+        rate_limit_per_second: int = 100,
+        enable_caching: bool = True,
+        cache_ttl: int = 300
     ):
         if not base_url.endswith('/'):
             base_url += '/'
@@ -90,10 +106,38 @@ class HammerspaceApiClient:
         self.password = password
         self.timeout = timeout
         self.verify_ssl = verify_ssl
+        self.max_retries = max_retries
+        self.retry_backoff_factor = retry_backoff_factor
+        
+        # Connection pooling configuration
+        self.max_connections = max_connections
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=max_connections,
+            pool_maxsize=max_connections,
+            max_retries=0  # We handle retries ourselves
+        )
         self.session = requests.Session()
-        self._lock = threading.Lock() # For thread-safe re-authentication
-        self.is_logged_in_via_cookie = False # Our belief about the session state
-        self.auth = None # We will rely on cookies, not basic auth for general calls
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
+        # Rate limiting
+        self.rate_limit_per_second = rate_limit_per_second
+        self._rate_limit_lock = threading.Lock()
+        self._request_times = []
+        
+        # Simple caching
+        self.enable_caching = enable_caching
+        self.cache_ttl = cache_ttl
+        self._cache = {}
+        self._cache_lock = threading.Lock()
+        
+        # Metrics collection
+        self.metrics = MetricsCollector()
+        
+        # Authentication state
+        self._lock = threading.Lock()
+        self.is_logged_in_via_cookie = False
+        self.auth = None
 
         if not verify_ssl:
             from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -127,7 +171,7 @@ class HammerspaceApiClient:
         self.licenses = LicensesClient(self)
         self.logical_volumes = LogicalVolumesClient(self)
         self.login_policy = LoginPolicyClient(self)
-        self.login = LoginClient(self) # LoginClient gets this API client instance
+        self.login = LoginClient(self)
         self.mailsmtp = MailsmtpClient(self)
         self.metrics = MetricsClient(self)
         self.modeler = ModelerClient(self)
@@ -178,6 +222,94 @@ class HammerspaceApiClient:
                 )
         logger.info(f"HammerspaceApiClient initialized for {self.base_url} with all clients.")
 
+    def _check_rate_limit(self):
+        """Check and enforce rate limiting."""
+        if self.rate_limit_per_second <= 0:
+            return  # No rate limiting
+            
+        current_time = time.time()
+        with self._rate_limit_lock:
+            # Remove requests older than 1 second
+            self._request_times = [req_time for req_time in self._request_times 
+                                   if current_time - req_time < 1.0]
+            
+            # Check if we need to wait
+            if len(self._request_times) >= self.rate_limit_per_second:
+                sleep_time = 1.0 - (current_time - self._request_times[0])
+                if sleep_time > 0:
+                    logger.debug(f"Rate limit reached. Sleeping for {sleep_time:.2f} seconds")
+                    time.sleep(sleep_time)
+                    # Clean up after sleep
+                    self._request_times = [req_time for req_time in self._request_times 
+                                           if time.time() - req_time < 1.0]
+            
+            # Record this request
+            self._request_times.append(time.time())
+
+    def _get_cache_key(self, path: str, method: str, params: Optional[Dict] = None) -> str:
+        """Generate a cache key for the request."""
+        key = f"{method}:{path}"
+        if params:
+            # Sort params for consistent keys
+            sorted_params = sorted(params.items())
+            key += f":{sorted_params}"
+        return key
+
+    def _get_from_cache(self, cache_key: str) -> Optional[Any]:
+        """Get response from cache if available and not expired."""
+        if not self.enable_caching:
+            return None
+            
+        with self._cache_lock:
+            if cache_key in self._cache:
+                cached_data, timestamp = self._cache[cache_key]
+                if time.time() - timestamp < self.cache_ttl:
+                    logger.debug(f"Cache hit for {cache_key}")
+                    return cached_data
+                else:
+                    logger.debug(f"Cache expired for {cache_key}")
+                    del self._cache[cache_key]
+        return None
+
+    def _set_cache(self, cache_key: str, data: Any):
+        """Store data in cache."""
+        if not self.enable_caching:
+            return
+            
+        with self._cache_lock:
+            self._cache[cache_key] = (data, time.time())
+            logger.debug(f"Cached response for {cache_key}")
+
+    def clear_cache(self):
+        """Clear the entire cache."""
+        with self._cache_lock:
+            self._cache.clear()
+        logger.info("Cache cleared")
+
+    @contextmanager
+    def session_context(self):
+        """Context manager for the client session."""
+        try:
+            yield self.session
+        finally:
+            # Cleanup if needed
+            pass
+
+    def close(self):
+        """Close the session and cleanup resources."""
+        self.session.close()
+        self.clear_cache()
+        logger.info("HammerspaceApiClient closed")
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current API usage metrics."""
+        return self.metrics.get_metrics()
+    
+    def reset_metrics(self):
+        """Reset all metrics."""
+        self.metrics.reset_metrics()
+        logger.info("Metrics reset")
+
     def _perform_login_action(self):
         """
         Performs the login action using the LoginClient.
@@ -210,6 +342,60 @@ class HammerspaceApiClient:
                 logger.error(f"Login action failed: {e}")
                 raise # Re-raise the original exception from login_user
 
+    def make_rest_call_with_retry(
+        self,
+        path: str,
+        method: str = "GET",
+        json_data: Optional[Dict[str, Any]] = None,
+        query_params: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, IO]] = None,
+        stream: bool = False,
+        data: Optional[Dict[str, Any]] = None,
+        is_login: bool = False,
+        is_absolute_url: bool = False,
+        custom_headers: Optional[Dict[str, str]] = None,
+        _is_retry_after_relogin: bool = False
+    ) -> requests.Response:
+        """
+        Makes a REST API call with retry logic for transient failures.
+        """
+        last_exception = None
+        retryable_exceptions = (ConnectionError, requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+        
+        for attempt in range(self.max_retries):
+            try:
+                return self.make_rest_call(
+                    path, method, json_data, query_params, files, stream, data,
+                    is_login, is_absolute_url, custom_headers, _is_retry_after_relogin
+                )
+            except retryable_exceptions as e:
+                last_exception = e
+                if attempt < self.max_retries - 1:  # Don't sleep on the last attempt
+                    wait_time = self.retry_backoff_factor * (2 ** attempt)
+                    logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {e}. "
+                                 f"Retrying in {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"All retry attempts exhausted for {method} {path}")
+                    raise RetryExhaustedError(
+                        f"Failed after {self.max_retries} attempts",
+                        total_attempts=self.max_retries,
+                        last_error=last_exception
+                    )
+            except (AuthenticationError, AuthorizationError, ValidationError, ResourceNotFoundError, ServerError):
+                # Don't retry on these specific errors
+                raise
+            except HammerspaceApiError as e:
+                last_exception = e
+                if attempt < self.max_retries - 1 and e.status_code and e.status_code >= 500:
+                    # Retry on server errors
+                    wait_time = self.retry_backoff_factor * (2 ** attempt)
+                    logger.warning(f"Server error (attempt {attempt + 1}/{self.max_retries}): {e}. "
+                                 f"Retrying in {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    raise
+
     def make_rest_call(
         self,
         path: str,
@@ -228,6 +414,16 @@ class HammerspaceApiClient:
         Makes a REST API call. Handles session expiration and re-login.
         'path' can be a relative path or a full URL if is_absolute_url is True.
         """
+        # Apply rate limiting
+        self._check_rate_limit()
+        
+        # Check cache for GET requests
+        if method == "GET" and not is_login and not _is_retry_after_relogin:
+            cache_key = self._get_cache_key(path, method, query_params)
+            cached_response = self._get_from_cache(cache_key)
+            if cached_response is not None:
+                return cached_response
+        
         # Lazy login: if credentials exist, not a login call itself, not a retry, and we don't think we're logged in
         if self.username and self.password and \
            not is_login and \
@@ -288,6 +484,15 @@ class HammerspaceApiClient:
             # If the call succeeded, and we are managing auth, update our belief
             if self.username and self.password and not is_login:
                  self.is_logged_in_via_cookie = True
+            
+            # Cache successful GET requests
+            if method == "GET" and not is_login and not _is_retry_after_relogin:
+                cache_key = self._get_cache_key(path, method, query_params)
+                response_data = self.read_and_parse_json_body(response)
+                if response_data is not None:
+                    self._set_cache(cache_key, response_data)
+                return response  # Return original response
+            
             return response
         except requests.exceptions.HTTPError as e:
             if (e.response.status_code == 401 and
@@ -316,71 +521,85 @@ class HammerspaceApiClient:
                         "The original request will fail with the 401 error."
                     )
             
-            # --- REFINED ERROR LOGGING STARTS HERE ---
+            # --- IMPROVED ERROR HANDLING WITH SPECIFIC EXCEPTIONS ---
             err_status = e.response.status_code
             err_reason = e.response.reason
-            concise_err_msg = f"HTTP error: {err_status} {err_reason} for {method} {url}."
+            err_message = f"HTTP error: {err_status} {err_reason} for {method} {url}."
             
-            # Attempt to parse more specific details if available
+            # Parse error details for more context
+            error_code = None
+            error_message_key = None
+            error_args = None
+            validation_errors = []
+            
             try:
                 if e.response.headers.get('Content-Type', '').startswith('application/json'):
                     err_details_list = e.response.json()
-                    # Assuming the error details are a list of dicts as per your example
                     if isinstance(err_details_list, list) and err_details_list:
                         first_error = err_details_list[0]
                         error_code = first_error.get('errorCode')
                         error_args = first_error.get('args')
-                        error_message_key = first_error.get('message') # e.g., VALIDATION_VIOLATION
-
-                        if error_code is not None: # Check if error_code was found
-                            concise_err_msg += (
-                                f" API Error Code: {error_code}."
-                            )
-                        if error_message_key:
-                             concise_err_msg += (
-                                f" Message: '{error_message_key}'."
-                             )
-                        if error_args:
-                            concise_err_msg += (
-                                f" Args: {error_args}."
-                            )
+                        error_message_key = first_error.get('message')
                         
-                        # For DEBUG level, log the full details including stack
-                        logger.debug(
-                            f"Full HTTP error details for {method} {url}: {err_details_list}"
-                        )
-                    else: # JSON, but not the expected list structure
-                        logger.debug(
-                            f"Unexpected JSON error structure for {method} {url}: {err_details_list}"
-                        )
-                        concise_err_msg += f" Details: {str(err_details_list)[:200]}"
-                else: # Not JSON
+                        if error_code:
+                            err_message += f" API Error Code: {error_code}."
+                        if error_message_key:
+                            err_message += f" Message: '{error_message_key}'."
+                        if error_args:
+                            err_message += f" Args: {error_args}."
+                        if error_code == "VALIDATION_VIOLATION":
+                            validation_errors = err_details_list
+                            
+                        logger.debug(f"Full HTTP error details for {method} {url}: {err_details_list}")
+                    else:
+                        logger.debug(f"Unexpected JSON error structure for {method} {url}: {err_details_list}")
+                        err_message += f" Details: {str(err_details_list)[:200]}"
+                else:
                     response_text_preview = e.response.text[:200]
-                    concise_err_msg += f" Response: {response_text_preview}"
-                    logger.debug(
-                        f"Full non-JSON error response for {method} {url}: {e.response.text[:1000]}"
-                    )
-            except ValueError: # JSONDecodeError
-                response_text_preview = e.response.text[:200]
-                concise_err_msg += f" Response (not valid JSON): {response_text_preview}"
-                logger.debug(
-                    f"Full invalid JSON error response for {method} {url}: {e.response.text[:1000]}"
-                )
-            except Exception as parse_exc: # Catch any other parsing error
+                    err_message += f" Response: {response_text_preview}"
+                    logger.debug(f"Full non-JSON error response for {method} {url}: {e.response.text[:1000]}")
+            except (ValueError, Exception) as parse_exc:
                 logger.debug(f"Error parsing error response details: {parse_exc}")
-                concise_err_msg += " Could not parse detailed error response."
+                err_message += " Could not parse detailed error response."
 
-            # Log the concise message at ERROR level
-            logger.error(concise_err_msg)
-            # --- REFINED ERROR LOGGING ENDS HERE ---
+            # Log the error
+            logger.error(err_message)
             
-            if e.response.status_code == 401:
+            # Update authentication state
+            if err_status == 401:
                 self.is_logged_in_via_cookie = False
             
-            raise # Re-raise the original requests.exceptions.HTTPError
+            # Raise specific exceptions based on status code
+            if err_status == 401:
+                raise AuthenticationError(err_message, err_status, e.response.text, error_code)
+            elif err_status == 403:
+                raise AuthorizationError(err_message, err_status, e.response.text, error_code)
+            elif err_status == 404:
+                raise ResourceNotFoundError(err_message, err_status, e.response.text, error_code)
+            elif err_status == 400:
+                raise ValidationError(err_message, err_status, e.response.text, error_code, validation_errors)
+            elif err_status == 429:
+                retry_after = e.response.headers.get('Retry-After')
+                retry_after_seconds = int(retry_after) if retry_after else None
+                raise RateLimitError(err_message, err_status, e.response.text, retry_after_seconds)
+            elif err_status >= 500:
+                raise ServerError(err_message, err_status, e.response.text, error_code)
+            else:
+                raise HammerspaceApiError(err_message, err_status, e.response.text, error_code)
         
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed for {method} {url}: {e}")
+            error_message = f"Request failed for {method} {url}: {e}"
+            logger.error(error_message)
+            
+            # Handle specific request exceptions
+            if isinstance(e, requests.exceptions.ConnectionError):
+                raise ConnectionError(f"Failed to connect to {url}: {e}", e)
+            elif isinstance(e, requests.exceptions.Timeout):
+                raise HammerspaceApiError(f"Request timed out for {method} {url}: {e}", status_code=None, error_code="TIMEOUT_ERROR")
+            elif isinstance(e, requests.exceptions.SSLError):
+                raise HammerspaceApiError(f"SSL error for {method} {url}: {e}", status_code=None, error_code="SSL_ERROR")
+            else:
+                raise ConnectionError(f"Request exception for {method} {url}: {e}", e)
   
 
     def read_and_parse_json_body(self, response: requests.Response) -> Optional[Union[Dict[str, Any], List[Any]]]:
@@ -413,17 +632,16 @@ class HammerspaceApiClient:
         it monitors the task at that Location. Otherwise, handles synchronous responses.
         """
         try:
-            initial_response = self.make_rest_call(
+            initial_response = self.make_rest_call_with_retry(
                 path,
                 method=method,
                 json_data=initial_json_data,
                 query_params=initial_query_params,
-                custom_headers=initial_headers # Pass through custom headers
+                custom_headers=initial_headers
             )
-        except requests.exceptions.RequestException as e: # Catch potential login or other request errors
+        except (HammerspaceApiError, requests.exceptions.RequestException) as e:
             logger.error(f"Initial API call failed for {method} {path} during task execution: {e}. Cannot monitor task.")
-            # Let the user know by re-raising or returning a specific failure indicator
-            raise # Or return a dict like {"error": str(e), "status": "initial_call_failed"}
+            raise HammerspaceApiError(f"Task initialization failed: {e}", status_code=getattr(e, 'status_code', None))
 
         initial_response_data = self.read_and_parse_json_body(initial_response)
 
@@ -493,14 +711,28 @@ class HammerspaceApiClient:
                     elif task_state in ["FAILED", "CANCELLED", "TIMED_OUT"]:
                         error_message = current_task_data.get("errorMessage", "Task failed, was cancelled, or timed out.")
                         logger.error(f"Task at {location_url} ended. State: {task_state}. Message: {error_message}")
-                        return current_task_data # Return the full task data indicating failure
+                        
+                        # Import TaskFailedError to raise specific exception
+                        from .exceptions import TaskFailedError
+                        raise TaskFailedError(
+                            f"Task failed with state {task_state}: {error_message}",
+                            task_details=current_task_data,
+                            status_code=500
+                        )
                 else:
                     logger.warning(f"Task data not found or not a dictionary while polling {location_url}. Retrying in {poll_interval_seconds}s...")
                 
                 time.sleep(poll_interval_seconds)
 
             logger.warning(f"Task monitoring for {location_url} timed out after {task_timeout_seconds} seconds.")
-            return last_known_status_data # Return the last known status on timeout
+            
+            # Import TaskTimeoutError to raise specific exception
+            from .exceptions import TaskTimeoutError
+            raise TaskTimeoutError(
+                f"Task monitoring timed out after {task_timeout_seconds} seconds",
+                task_id=location_url,
+                timeout_seconds=task_timeout_seconds
+            )
 
         # Fallback for unexpected status codes from initial call
         logger.warning(f"Initial call returned status {initial_response.status_code} which is not a standard success or task initiation. Response: {initial_response_data}")

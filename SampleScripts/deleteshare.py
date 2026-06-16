@@ -1,17 +1,27 @@
-# example_create_share.py
+# deleteshare.py
+import os
 import logging
+from dotenv import load_dotenv
 from hammerspace.client import HammerspaceApiClient
 
+# Load environment variables from .env file
+load_dotenv()
+
 # Configure basic logging for visibility
-logging.basicConfig(level=logging.CRITICAL, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-# Replace with your Hammerspace API details
-HS_BASE_URL = "https://ANVILSERVER:8443/mgmt/v1.2/rest" # Or your specific version
-HS_USERNAME = "admin"
-HS_PASSWORD = "Your Password"
-VERIFY_SSL = False # Set to True in production with valid certs
+# Get credentials from environment variables
+HS_BASE_URL = os.getenv("HS_BASE_URL")
+HS_USERNAME = os.getenv("HS_USERNAME")
+HS_PASSWORD = os.getenv("HS_PASSWORD")
+VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() in ("true", "1", "t")
+
+# Validate required environment variables
+if not all([HS_BASE_URL, HS_USERNAME, HS_PASSWORD]):
+    logger.error("Missing required environment variables. Please set HS_BASE_URL, HS_USERNAME, and HS_PASSWORD in .env file.")
+    raise ValueError("Missing required environment variables")
 
 def main():
     logger.info("Initializing Hammerspace API client...")

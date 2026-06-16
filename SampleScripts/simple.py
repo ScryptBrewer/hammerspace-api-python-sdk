@@ -1,12 +1,18 @@
-from hammerspace.client import HammerspaceApiClient 
+import os
+from dotenv import load_dotenv
+from hammerspace.client import HammerspaceApiClient
 
-SHARE_NAME = "Share007"
+# Load environment variables from .env file
+load_dotenv()
 
+SHARE_NAME = os.getenv("SHARE_NAME", "Share007")
+
+# Get credentials from environment variables
 client = HammerspaceApiClient(
-            base_url="https://ANVILSERVER:8443/mgmt/v1.2/rest",
-            username="admin",
-            password="Your Password",
-            verify_ssl=False
+            base_url=os.getenv("HS_BASE_URL", "https://ANVILSERVER:8443/mgmt/v1.2/rest"),
+            username=os.getenv("HS_USERNAME", "admin"),
+            password=os.getenv("HS_PASSWORD"),
+            verify_ssl=os.getenv("VERIFY_SSL", "False").lower() in ("true", "1", "t")
         )
 
 ## Create share Example

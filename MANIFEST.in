@@ -1,0 +1,23 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include USER_GUIDE.md
+include API_REFERENCE.md
+include CRITICAL_FIXES_SUMMARY.md
+include .env.example
+include requirements.txt
+include pyproject.toml
+recursive-include hammerspace *.py
+recursive-include hammerspace *.md
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store
+prune SampleScripts
+prune tests
+prune htmlcov
+prune .pytest_cache
+prune .mypy_cache
+prune build
+prune dist
+prune *.egg-info
