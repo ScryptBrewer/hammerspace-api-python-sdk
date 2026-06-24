@@ -1,4 +1,5 @@
 # hammerspace/client.py
+import os
 import requests
 import time
 import logging
@@ -87,11 +88,11 @@ logger = logging.getLogger(__name__)
 class HammerspaceApiClient:
     def __init__(
         self,
-        base_url: str,
+        base_url: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
         timeout: int = 60,
-        verify_ssl: bool = True,
+        verify_ssl: Optional[bool] = None,
         max_retries: int = 3,
         retry_backoff_factor: float = 0.5,
         max_connections: int = 10,
@@ -99,6 +100,26 @@ class HammerspaceApiClient:
         enable_caching: bool = True,
         cache_ttl: int = 300
     ):
+        # Default connection settings from the environment (optionally a .env
+        # file via python-dotenv) so credentials are never hardcoded.
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+
+        base_url = base_url or os.getenv("HS_BASE_URL")
+        username = username or os.getenv("HS_USERNAME")
+        password = password or os.getenv("HS_PASSWORD")
+        if verify_ssl is None:
+            verify_ssl = os.getenv("VERIFY_SSL", "True").lower() in ("true", "1", "t")
+
+        if not base_url:
+            raise ConfigurationError(
+                "base_url is required. Pass it directly or set the HS_BASE_URL "
+                "environment variable (see .env.example)."
+            )
+
         if not base_url.endswith('/'):
             base_url += '/'
         self.base_url = base_url
@@ -418,7 +439,7 @@ class HammerspaceApiClient:
         self._check_rate_limit()
         
         # Check cache for GET requests
-        if method == "GET" and not is_login and not _is_retry_after_relogin:
+        if method == "GET" and not is_login and not _is_retry_after_relogin and not is_absolute_url:
             cache_key = self._get_cache_key(path, method, query_params)
             cached_response = self._get_from_cache(cache_key)
             if cached_response is not None:
@@ -486,7 +507,7 @@ class HammerspaceApiClient:
                  self.is_logged_in_via_cookie = True
             
             # Cache successful GET requests
-            if method == "GET" and not is_login and not _is_retry_after_relogin:
+            if method == "GET" and not is_login and not _is_retry_after_relogin and not is_absolute_url:
                 cache_key = self._get_cache_key(path, method, query_params)
                 response_data = self.read_and_parse_json_body(response)
                 if response_data is not None:
@@ -602,7 +623,10 @@ class HammerspaceApiClient:
                 raise ConnectionError(f"Request exception for {method} {url}: {e}", e)
   
 
-    def read_and_parse_json_body(self, response: requests.Response) -> Optional[Union[Dict[str, Any], List[Any]]]:
+    def read_and_parse_json_body(self, response: Union[requests.Response, Dict[str, Any], List[Any]]) -> Optional[Union[Dict[str, Any], List[Any]]]:
+        # Tolerate already-parsed bodies (e.g. values returned from the GET cache).
+        if isinstance(response, (dict, list)):
+            return response
         if response.status_code == 204: return None
         if not response.content: return None # No content to parse
         content_type = response.headers.get('Content-Type', '')

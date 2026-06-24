@@ -20,23 +20,23 @@ class HammerspaceApiError(Exception):
 
 class AuthenticationError(HammerspaceApiError):
     """Exception raised when authentication fails."""
-    def __init__(self, message: str = "Authentication failed", status_code: int = 401, response_text: str = None):
-        super().__init__(message, status_code, response_text, "AUTHENTICATION_ERROR")
+    def __init__(self, message: str = "Authentication failed", status_code: int = 401, response_text: str = None, error_code: str = "AUTHENTICATION_ERROR"):
+        super().__init__(message, status_code, response_text, error_code)
 
 class AuthorizationError(HammerspaceApiError):
     """Exception raised when user is authorized but lacks permissions for the requested operation."""
-    def __init__(self, message: str = "Authorization failed - insufficient permissions", status_code: int = 403, response_text: str = None):
-        super().__init__(message, status_code, response_text, "AUTHORIZATION_ERROR")
+    def __init__(self, message: str = "Authorization failed - insufficient permissions", status_code: int = 403, response_text: str = None, error_code: str = "AUTHORIZATION_ERROR"):
+        super().__init__(message, status_code, response_text, error_code)
 
 class ResourceNotFoundError(HammerspaceApiError):
     """Exception raised when a requested resource is not found."""
-    def __init__(self, message: str = "Resource not found", status_code: int = 404, response_text: str = None):
-        super().__init__(message, status_code, response_text, "RESOURCE_NOT_FOUND")
+    def __init__(self, message: str = "Resource not found", status_code: int = 404, response_text: str = None, error_code: str = "RESOURCE_NOT_FOUND"):
+        super().__init__(message, status_code, response_text, error_code)
 
 class ValidationError(HammerspaceApiError):
     """Exception raised when request validation fails."""
-    def __init__(self, message: str = "Request validation failed", status_code: int = 400, response_text: str = None, validation_errors: list = None):
-        super().__init__(message, status_code, response_text, "VALIDATION_ERROR")
+    def __init__(self, message: str = "Request validation failed", status_code: int = 400, response_text: str = None, error_code: str = "VALIDATION_ERROR", validation_errors: list = None):
+        super().__init__(message, status_code, response_text, error_code)
         self.validation_errors = validation_errors or []
 
 class RateLimitError(HammerspaceApiError):
@@ -47,8 +47,8 @@ class RateLimitError(HammerspaceApiError):
 
 class ServerError(HammerspaceApiError):
     """Exception raised when the server encounters an unexpected error."""
-    def __init__(self, message: str = "Server error occurred", status_code: int = 500, response_text: str = None):
-        super().__init__(message, status_code, response_text, "SERVER_ERROR")
+    def __init__(self, message: str = "Server error occurred", status_code: int = 500, response_text: str = None, error_code: str = "SERVER_ERROR"):
+        super().__init__(message, status_code, response_text, error_code)
 
 class TaskTimeoutError(HammerspaceApiError):
     """Exception raised when a task monitoring times out."""

@@ -5,6 +5,7 @@ Setup script for Hammerspace API Python SDK
 
 from setuptools import setup, find_packages
 import os
+import re
 
 # Read the README file for long description
 def read_file(filename):
@@ -14,12 +15,11 @@ def read_file(filename):
 
 # Get the version from __init__.py
 def get_version():
-    """Extract version from __init__.py."""
+    """Extract version from __init__.py without importing the package."""
     version_file = os.path.join(os.path.dirname(__file__), 'hammerspace', '__init__.py')
-    version_dict = {}
     with open(version_file, encoding='utf-8') as f:
-        exec(f.read(), version_dict)
-    return version_dict.get('__version__', '0.1.0')
+        match = re.search(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]", f.read(), re.MULTILINE)
+    return match.group(1) if match else '0.1.0'
 
 setup(
     name='hammerspace-api-client',

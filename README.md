@@ -8,41 +8,98 @@ The Hammerspace Python API Client is a comprehensive library that provides progr
 
 ### Installation
 
+#### Prerequisites
+
+- Python 3.8 or newer
+- `pip` (bundled with Python)
+
+#### Install from PyPI
+
 ```bash
 pip install hammerspace-api-client
 ```
 
+#### Install from a local checkout (recommended for development or offline use)
+
+Installing into a virtual environment is strongly recommended so the SDK and its
+dependencies don't clash with other projects. From the project root directory:
+
+```bash
+# 1. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate        # macOS / Linux
+# .venv\Scripts\activate         # Windows PowerShell
+
+# 2. Upgrade pip, then install the package from this directory
+python -m pip install --upgrade pip
+pip install .
+```
+
+#### Editable (development) install
+
+Use an editable install to make changes to the source take effect immediately
+without reinstalling — ideal while developing or debugging the SDK:
+
+```bash
+pip install -e .
+```
+
+#### Install with development dependencies
+
+Adds the linting, formatting, type-checking, and testing tooling
+(pytest, black, isort, flake8, mypy, etc.):
+
+```bash
+pip install -e ".[dev]"
+```
+
+#### Build a wheel for offline installation
+
+Build a redistributable wheel from the local source, then install it
+(e.g. on a host without internet access):
+
+```bash
+python -m pip install build
+python -m build            # produces dist/hammerspace_api_client-0.1.0-py3-none-any.whl
+pip install dist/hammerspace_api_client-0.1.0-py3-none-any.whl
+```
+
+#### Verify the installation
+
+```bash
+python -c "import hammerspace; print(hammerspace.__version__)"
+```
+
+You should see the installed version (e.g. `0.1.0`) printed with no errors.
+
 ## Basic Configuration
 
-```python
-from hammerspace import api_client
+The client reads its connection details from environment variables (or a local
+`.env` file) rather than hardcoded values. Copy `.env.example` to `.env` and fill
+in your values — `HS_BASE_URL`, `HS_USERNAME`, `HS_PASSWORD`, and `VERIFY_SSL`.
 
-# Initialize the API client
-client = api_client.ApiClient(
-    url="https://hammerspace-server",
-    username="admin",
-    password="password"
-)
+```python
+from hammerspace.client import HammerspaceApiClient
+
+# The client is configured from HS_BASE_URL / HS_USERNAME / HS_PASSWORD /
+# VERIFY_SSL in your environment or .env file. No credentials in code.
+client = HammerspaceApiClient()
 
 # Now you can use the client to interact with various Hammerspace modules
+# (e.g. client.shares, client.nodes, client.snapshots, ...)
 ```
 
 ## Creating a Basic Script
 Here's a simple example script that demonstrates how to use the Hammerspace API client to list shares and create a new share:
 
 ```python
-from hammerspace import api_client
-from hammerspace.shares import SharesClient
+from hammerspace.client import HammerspaceApiClient
 
-# Initialize the API client
-client = api_client.ApiClient(
-    url="https://hammerspace-server",
-    username="admin",
-    password="password"
-)
+# Client is configured from your environment / .env file (see .env.example)
+client = HammerspaceApiClient()
 
-# Create a shares client
-shares = SharesClient(client)
+# Access the shares sub-client (the client exposes one per module)
+shares = client.shares
 
 # List all shares
 all_shares = shares.get(simple=True)
@@ -236,12 +293,11 @@ Helper method to create snapshot schedule configuration.
 
 ##### Simple Share Creation
 ```python
-from hammerspace import api_client
-from hammerspace.shares import SharesClient
+from hammerspace.client import HammerspaceApiClient
 
-# Initialize the API client
-client = api_client.ApiClient(url="https://hammerspace-server", username="admin", password="password")
-shares = SharesClient(client)
+# Client is configured from your environment / .env file
+client = HammerspaceApiClient()
+shares = client.shares
 
 # Create a simple share
 result = shares.create(
