@@ -48,7 +48,7 @@ def main():
             logger.info(f"Attempting to delete share count: {len(findshare)}")
 
             # Simpler call if no extra query params are needed beyond the body
-            result = client.shares.delete_share(
+            result = client.shares.delete(
                 identifier=findshare[0].get('uoid', {}).get('uuid', {}),
                 monitor_task=False, # Set to False if you know it's always synchronous (200 OK)
                 task_timeout_seconds=600

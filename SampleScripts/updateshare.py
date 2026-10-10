@@ -49,7 +49,7 @@ def main():
             find_data[0]['comment'] = "this is a new Comment for the share UPDATED!!!!"
             
             # Simpler call if no extra query params are needed beyond the body
-            result = client.shares.update_share(
+            result = client.shares.update(
                 identifier=find_data[0].get('uoid', {}).get('uuid'),
                 share_data=find_data[0],
                 monitor_task=True, # Set to False if you know it's always synchronous (200 OK)

@@ -160,3 +160,6 @@ cython_debug/
 #.idea/
 .DS_Store
 CRITICAL_FIXES_SUMMARY.md
+Hammerspace_5_3_swagger.json
+PYDANTIC_MIGRATION_PLAN.md
+.venv-chatbot/

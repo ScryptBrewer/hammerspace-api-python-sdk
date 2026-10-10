@@ -3,7 +3,7 @@
 Hammerspace API Client Library
 """
 
-__version__ = "0.1.0" # Example version, update as you see fit
+__version__ = "1.1.0"
 
 # Import the main API client first, as other clients might depend on its types for hinting
 from .client import HammerspaceApiClient

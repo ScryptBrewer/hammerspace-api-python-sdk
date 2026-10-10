@@ -82,7 +82,7 @@ def main():
         # If it's always synchronous (200 OK), set monitor_task=False.
         
         # Example: Passing query parameters if needed
-        # result = client.shares.create_share(
+        # result = client.shares.create(
         #     share_data=share_data,
         #     create_path=True, # Example query parameter
         #     monitor_task=True, # Default in your client if 202 is possible
@@ -90,7 +90,7 @@ def main():
         # )
 
         # Simpler call if no extra query params are needed beyond the body
-        result = client.shares.create_share(
+        result = client.shares.create(
             share_data=share_data,
             monitor_task=True, # Set to False if you know it's always synchronous (200 OK)
             task_timeout_seconds=600

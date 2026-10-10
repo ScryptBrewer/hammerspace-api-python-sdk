@@ -185,70 +185,10 @@ class SitesClient:
         path = f"/sites/{identifier}"
         logger.info(f"Deleting remote site '{identifier}'.")
         # DELETE /sites/{identifier} in spec does not list query parameters
-        return self.api_client.execute_and_monitor__task(
-            path=path,
-            method="DELETE",
-            monitor_task=monitor_task,
-            task_timeout_seconds=task_timeout_seconds
-        )
-    # --- (Assuming they are still needed as separate operations) ---
-
-    def add_remote_site(
-        self,
-        remote_site_data: Dict[str, Any],
-        monitor_task: bool = True,
-        task_timeout_seconds: int = 300,
-        **kwargs
-    ) -> Union[Optional[str], Optional[Dict[str, Any]]]:
-        """
-        Add a new remote site. (POST /sites - OpId: addRemoteSite)
-        """
-        path = "/sites"
-        logger.info(f"Adding remote site with data: {remote_site_data}")
-        return self.api_client.execute_and_monitor_task(
-            path=path,
-            method="POST",
-            initial_json_data=remote_site_data,
-            monitor_task=monitor_task,
-            task_timeout_seconds=task_timeout_seconds
-        )
-
-    def update_site(
-        self,
-        identifier: str,
-        site_data: Dict[str, Any],
-        monitor_task: bool = True,
-        task_timeout_seconds: int = 300,
-        **kwargs
-    ) -> Union[Optional[str], Optional[Dict[str, Any]]]:
-        """
-        Update a site. (PUT /sites/{identifier} - OpId: put)
-        """
-        path = f"/sites/{identifier}"
-        logger.info(f"Updating site '{identifier}' with data: {site_data}")
-        return self.api_client.execute_and_monitor_task(
-            path=path,
-            method="PUT",
-            initial_json_data=site_data,
-            monitor_task=monitor_task,
-            task_timeout_seconds=task_timeout_seconds
-        )
-
-    def delete_remote_site(
-        self,
-        identifier: str,
-        monitor_task: bool = True,
-        task_timeout_seconds: int = 300,
-        **kwargs
-    ) -> Union[Optional[str], Optional[Dict[str, Any]]]:
-        """
-        Remove a remote site. (DELETE /sites/{identifier} - OpId: delete)
-        """
-        path = f"/sites/{identifier}"
-        logger.info(f"Deleting remote site '{identifier}'.")
         return self.api_client.execute_and_monitor_task(
             path=path,
             method="DELETE",
             monitor_task=monitor_task,
             task_timeout_seconds=task_timeout_seconds
         )
+

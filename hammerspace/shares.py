@@ -1,6 +1,10 @@
 # hammerspace/shares.py
 import logging
 from typing import Optional, List, Dict, Any, Union
+
+from .models.share import ShareCreate, ShareUpdate, ShareView
+from .models.base import HammerspaceBaseModel
+
 logger = logging.getLogger(__name__)
 
 class SharesClient:
@@ -11,8 +15,9 @@ class SharesClient:
         self,
         identifier: Optional[str] = None,
         simple: bool = False,
+        as_model: bool = False,
         **kwargs
-    ) -> Union[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
+    ) -> Union[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]], Optional[List[ShareView]], Optional[ShareView]]:
         """
         Gets all shares or a specific share by its identifier (UUID or name).
 
@@ -21,15 +26,16 @@ class SharesClient:
 
         Otherwise, lists all shares.
         (Corresponds to GET /shares - OpId: ListShares)
-        
+
         Args:
             identifier: Share UUID or name to fetch specific share
             simple: If True, returns only uuid, name, and path fields
+            as_model: If True, returns ShareView models instead of raw dicts
             **kwargs: Optional query params for listing (spec, page, page_size, page_sort, page_sort_dir)
         """
         query_params = {}
         if identifier:
-            path = f"/shares/{identifier}" 
+            path = f"/shares/{identifier}"
             logger.warning(
                 f"get_share by id: Attempting GET from '{path}'. "
             )
@@ -41,40 +47,43 @@ class SharesClient:
             if "page_sort" in kwargs: query_params["page.sort"] = kwargs["page_sort"]
             if "page_sort_dir" in kwargs: query_params["page.sort.dir"] = kwargs["page_sort_dir"]
             logger.info(f"Listing shares with effective query params: {query_params}")
-        
+
         response = self.api_client.make_rest_call(path=path, method="GET", query_params=query_params)
-        result = self.api_client.read_and_parse_json_body(response)
-        
+        result = self.api_client.read_and_parse_json_body(response, model=ShareView if as_model else None)
+
         if simple and result:
             return self._simplify_shares_response(result)
-        
+
         return result
 
-    def _simplify_shares_response(self, shares_data: Union[List[Dict[str, Any]], Dict[str, Any]]) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+    def _simplify_shares_response(self, shares_data: Union[List[Any], Dict[str, Any], ShareView]) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Simplifies share response to only include uuid, name, and path fields.
-        
+
         Args:
-            shares_data: Full share data from API response
-            
+            shares_data: Full share data from API response (dicts or ShareView models)
+
         Returns:
             Simplified share data with only uuid, name, and path
         """
-        def extract_simple_fields(share: Dict[str, Any]) -> Dict[str, Any]:
+        def extract_simple_fields(share: Any) -> Dict[str, Any]:
+            if isinstance(share, ShareView):
+                return {"uuid": share.uuid, "name": share.name, "path": share.path}
+            uoid = share.get("uoid")
             return {
-                "uuid": share.get("uoid", {}).get("uuid"),
+                "uuid": uoid.get("uuid") if isinstance(uoid, dict) else None,
                 "name": share.get("name"),
                 "path": share.get("path")
             }
-        
+
         if isinstance(shares_data, list):
             return [extract_simple_fields(share) for share in shares_data]
         else:
             return extract_simple_fields(shares_data)
 
     def create(
-        self, 
-        share_data: Optional[Dict[str, Any]] = None,
+        self,
+        share_data: Optional[Union[ShareCreate, Dict[str, Any]]] = None,
         name: Optional[str] = None,
         path: Optional[str] = None,
         comment: Optional[str] = None,
@@ -87,16 +96,18 @@ class SharesClient:
         create_snapshots: bool = False,
         snapshot_schedules: Optional[List[Dict[str, Any]]] = None,
         use_default_snapshot_plans: bool = True,
-        monitor_task: bool = True, 
-        task_timeout_seconds: int = 300
-    ) -> Union[Optional[str], Optional[Dict[str, Any]]]:
+        monitor_task: bool = True,
+        task_timeout_seconds: int = 300,
+        as_model: bool = False
+    ) -> Union[Optional[str], Optional[Dict[str, Any]], Optional[ShareView]]:
         """
         Creates a new share with optional snapshot configuration.
-        
+
         Args:
-            share_data: Complete share configuration dict (if provided, other params ignored)
+            share_data: Complete share configuration as a dict or ShareCreate model
+                        (if provided, other params ignored)
             name: Share name (required if share_data not provided)
-            path: Share path (required if share_data not provided)  
+            path: Share path (required if share_data not provided)
             comment: Share description
             export_options: List of export option dicts
             share_objectives: List of objective dicts
@@ -108,6 +119,7 @@ class SharesClient:
             use_default_snapshot_plans: Use system default snapshot retention plans
             monitor_task: Whether to monitor the task
             task_timeout_seconds: Task timeout
+            as_model: If True, returns a ShareView model instead of raw data
         """
         if share_data is None:
             if not name or not path:
@@ -118,16 +130,21 @@ class SharesClient:
                 warn_utilization_percent_threshold=warn_utilization_percent_threshold,
                 smb_browsable=smb_browsable
             )
-        
+        if isinstance(share_data, HammerspaceBaseModel):
+            # Normalize to a wire dict so downstream dict access (share name)
+            # keeps working; the client would serialize it anyway.
+            share_data = share_data.to_api()
+
         assumed_path = "/shares"
         logger.warning(f"create_share: Attempting POST to '{assumed_path}'.")
-        
+
         # Create the share first
         result = self.api_client.execute_and_monitor_task(
             path=assumed_path, method="POST", initial_json_data=share_data,
-            monitor_task=monitor_task, task_timeout_seconds=task_timeout_seconds
+            monitor_task=monitor_task, task_timeout_seconds=task_timeout_seconds,
+            result_model=ShareView if as_model else None
         )
-        
+
         # If share creation was successful and snapshots requested, create snapshot schedules
         if result and create_snapshots:
             share_name = share_data.get("name")
@@ -140,13 +157,13 @@ class SharesClient:
                 except Exception as e:
                     logger.error(f"Failed to create snapshots for share '{share_name}': {e}")
                     # Don't fail the entire operation if snapshot creation fails
-        
+
         return result
 
     def update(
-        self, 
-        identifier: str, 
-        share_data: Optional[Dict[str, Any]] = None,
+        self,
+        identifier: str,
+        share_data: Optional[Union[ShareUpdate, Dict[str, Any]]] = None,
         name: Optional[str] = None,
         path: Optional[str] = None,
         comment: Optional[str] = None,
@@ -155,15 +172,17 @@ class SharesClient:
         share_size_limit: Optional[int] = None,
         warn_utilization_percent_threshold: Optional[int] = None,
         smb_browsable: Optional[bool] = None,
-        monitor_task: bool = True, 
-        task_timeout_seconds: int = 300
-    ) -> Union[Optional[str], Optional[Dict[str, Any]]]:
+        monitor_task: bool = True,
+        task_timeout_seconds: int = 300,
+        as_model: bool = False
+    ) -> Union[Optional[str], Optional[Dict[str, Any]], Optional[ShareView]]:
         """
         Updates a specific share by its identifier.
-        
+
         Args:
             identifier: Share UUID or name
-            share_data: Complete share configuration dict (if provided, other params ignored)
+            share_data: Complete share configuration as a dict or ShareUpdate model
+                        (if provided, other params ignored)
             name: Share name
             path: Share path
             comment: Share description
@@ -174,6 +193,7 @@ class SharesClient:
             smb_browsable: Whether share is SMB browsable
             monitor_task: Whether to monitor the task
             task_timeout_seconds: Task timeout
+            as_model: If True, returns a ShareView model instead of raw data
         """
         if share_data is None:
             share_data = self._build_share_data(
@@ -182,13 +202,16 @@ class SharesClient:
                 warn_utilization_percent_threshold=warn_utilization_percent_threshold,
                 smb_browsable=smb_browsable
             )
-        
+        if isinstance(share_data, HammerspaceBaseModel):
+            share_data = share_data.to_api()
+
         assumed_path = f"/shares/{identifier}"
         logger.warning(f"update_share_by_id: Attempting PUT to '{assumed_path}'.")
-        
+
         return self.api_client.execute_and_monitor_task(
             path=assumed_path, method="PUT", initial_json_data=share_data,
-            monitor_task=monitor_task, task_timeout_seconds=task_timeout_seconds
+            monitor_task=monitor_task, task_timeout_seconds=task_timeout_seconds,
+            result_model=ShareView if as_model else None
         )
 
     def _build_share_data(
@@ -204,7 +227,10 @@ class SharesClient:
     ) -> Dict[str, Any]:
         """
         Builds share data dictionary from individual parameters.
-        
+
+        Delegates to the ShareUpdate model for validation and camelCase
+        serialization; only provided fields are included.
+
         Args:
             name: Share name
             path: Share path
@@ -214,30 +240,21 @@ class SharesClient:
             share_size_limit: Size limit in bytes
             warn_utilization_percent_threshold: Warning threshold percentage
             smb_browsable: SMB browsable flag
-            
+
         Returns:
             Dictionary containing share configuration
         """
-        share_data = {}
-        
-        if name is not None:
-            share_data["name"] = name
-        if path is not None:
-            share_data["path"] = path
-        if comment is not None:
-            share_data["comment"] = comment
-        if export_options is not None:
-            share_data["exportOptions"] = export_options
-        if share_objectives is not None:
-            share_data["shareObjectives"] = share_objectives
-        if share_size_limit is not None:
-            share_data["shareSizeLimit"] = share_size_limit
-        if warn_utilization_percent_threshold is not None:
-            share_data["warnUtilizationPercentThreshold"] = warn_utilization_percent_threshold
-        if smb_browsable is not None:
-            share_data["smbBrowsable"] = smb_browsable
-        
-        return share_data
+        share = ShareUpdate(
+            name=name,
+            path=path,
+            comment=comment,
+            export_options=export_options,
+            share_objectives=share_objectives,
+            share_size_limit=share_size_limit,
+            warn_utilization_percent_threshold=warn_utilization_percent_threshold,
+            smb_browsable=smb_browsable,
+        )
+        return share.to_api()
 
     def create_export_option(
         self,
@@ -299,7 +316,13 @@ class SharesClient:
     ) -> Union[Optional[str], Optional[Dict[str, Any]]]:
         """
         Deletes a specific share by its identifier, optionally deleting snapshots first.
-        
+
+        The plain DELETE (including the post-cascade delete when
+        ``delete_snapshots=True``) delegates to the spec-generated typed client
+        (``client.generated.shares.delete``) so both entry points share one
+        implementation; ``delete_snapshots=True`` only adds the pre-delete
+        snapshot cascade on top.
+
         Args:
             identifier: Share UUID or name
             delete_snapshots: Whether to delete all snapshots before deleting share
@@ -314,14 +337,25 @@ class SharesClient:
             except Exception as e:
                 logger.error(f"Failed to delete snapshots for share '{identifier}': {e}")
                 # Continue with share deletion even if snapshot deletion fails
-        
+
+        generated = getattr(self.api_client, "generated", None)
+        if generated is not None:
+            return generated.shares.delete(
+                identifier,
+                delete_delay=str(kwargs.get("delete_delay", "0")),
+                delete_path=str(kwargs.get("delete_path", True)).lower(),
+                monitor_task=monitor_task,
+                task_timeout_seconds=task_timeout_seconds,
+            )
+
+        # Fallback for api_client doubles without the generated typed layer.
         assumed_path = f"/shares/{identifier}"
         logger.warning(f"delete_share_by_id: Attempting DELETE to '{assumed_path}'.")
-        
+
         query_params = {}
         query_params["delete-delay"] = str(kwargs.get("delete_delay", "0"))
         query_params["delete-path"] = str(kwargs.get("delete_path", True)).lower()
-        
+
         return self.api_client.execute_and_monitor_task(
             path=assumed_path, method="DELETE", initial_query_params=query_params,
             initial_headers={"accept": "application/json"},

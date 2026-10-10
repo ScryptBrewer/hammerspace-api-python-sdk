@@ -4,15 +4,18 @@ import requests
 import time
 import logging
 import threading
-from typing import Optional, Dict, Any, Union, List, IO
+from typing import Optional, Dict, Any, Union, List, IO, Type
 from contextlib import contextmanager
 from collections import defaultdict
+from pydantic import BaseModel as PydanticBaseModel
+from pydantic import ValidationError as PydanticValidationError
 from .exceptions import (
-    HammerspaceApiError, AuthenticationError, AuthorizationError, 
+    HammerspaceApiError, AuthenticationError, AuthorizationError,
     ResourceNotFoundError, ValidationError, RateLimitError, ServerError,
     ConnectionError, ConfigurationError, RetryExhaustedError
 )
 from .logging_config import MetricsCollector
+from .models.common import TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,51 @@ from .volume_groups import VolumeGroupsClient
 
 logger = logging.getLogger(__name__)
 
+
+def serialize_body(payload: Any) -> Any:
+    """Convert pydantic request bodies to wire-compatible dicts (camelCase aliases)."""
+    if isinstance(payload, PydanticBaseModel):
+        to_api = getattr(payload, "to_api", None)
+        if callable(to_api):
+            return to_api()
+        return payload.model_dump(by_alias=True, exclude_unset=True, exclude_none=True)
+    if isinstance(payload, list):
+        return [serialize_body(item) for item in payload]
+    return payload
+
+
+_REDACT_PARAM_SUBSTRINGS = (
+    "password", "secret", "token", "credential", "api-key", "authorization", "cookie",
+)
+
+
+def redact_params(params: Any) -> Any:
+    """Copy query params with credential-looking values masked for logging."""
+    if not isinstance(params, dict):
+        return params
+    redacted = {}
+    for key, value in params.items():
+        lowered = str(key).lower()
+        if any(marker in lowered for marker in _REDACT_PARAM_SUBSTRINGS):
+            redacted[key] = "***"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+def scrub_exception_message(exc: BaseException, params: Any) -> str:
+    """Mask credential query params a transport exception echoed from the URL."""
+    message = str(exc)
+    if isinstance(params, dict):
+        for key, value in params.items():
+            if value is None or not any(
+                marker in str(key).lower() for marker in _REDACT_PARAM_SUBSTRINGS
+            ):
+                continue
+            message = message.replace(f"{key}={value}", f"{key}=***")
+    return message
+
+
 class HammerspaceApiClient:
     def __init__(
         self,
@@ -98,7 +146,8 @@ class HammerspaceApiClient:
         max_connections: int = 10,
         rate_limit_per_second: int = 100,
         enable_caching: bool = True,
-        cache_ttl: int = 300
+        cache_ttl: int = 300,
+        return_raw: bool = False
     ):
         # Default connection settings from the environment (optionally a .env
         # file via python-dotenv) so credentials are never hardcoded.
@@ -151,6 +200,11 @@ class HammerspaceApiClient:
         self.cache_ttl = cache_ttl
         self._cache = {}
         self._cache_lock = threading.Lock()
+
+        # Response modelling: when False (default), typed model results are
+        # returned by methods that request them; when True, every response is
+        # returned as raw parsed JSON regardless of requested models.
+        self.return_raw = return_raw
         
         # Metrics collection
         self.metrics = MetricsCollector()
@@ -232,6 +286,9 @@ class HammerspaceApiClient:
         self.versions = VersionsClient(self)
         self.volume_groups = VolumeGroupsClient(self)
 
+        # Spec-generated typed clients (opt-in layer), built lazily on first access.
+        self._generated: Optional[Any] = None
+
         # Attempt initial login if credentials are provided
         if self.username and self.password:
             try:
@@ -242,6 +299,19 @@ class HammerspaceApiClient:
                     "Will attempt lazily if needed."
                 )
         logger.info(f"HammerspaceApiClient initialized for {self.base_url} with all clients.")
+
+    @property
+    def generated(self) -> Any:
+        """Spec-generated typed clients, e.g. ``client.generated.shares.list()``.
+
+        Instantiated on first access so users who never touch the typed layer
+        do not pay the import cost.
+        """
+        if self._generated is None:
+            from hammerspace.generated import GeneratedApiNamespace
+
+            self._generated = GeneratedApiNamespace(self)
+        return self._generated
 
     def _check_rate_limit(self):
         """Check and enforce rate limiting."""
@@ -286,6 +356,13 @@ class HammerspaceApiClient:
                 cached_data, timestamp = self._cache[cache_key]
                 if time.time() - timestamp < self.cache_ttl:
                     logger.debug(f"Cache hit for {cache_key}")
+                    if isinstance(cached_data, PydanticBaseModel):
+                        return cached_data.model_copy()
+                    if isinstance(cached_data, list):
+                        return [
+                            item.model_copy() if isinstance(item, PydanticBaseModel) else item
+                            for item in cached_data
+                        ]
                     return cached_data
                 else:
                     logger.debug(f"Cache expired for {cache_key}")
@@ -367,33 +444,37 @@ class HammerspaceApiClient:
         self,
         path: str,
         method: str = "GET",
-        json_data: Optional[Dict[str, Any]] = None,
+        json_data: Optional[Union[Dict[str, Any], List[Any], PydanticBaseModel]] = None,
         query_params: Optional[Dict[str, Any]] = None,
         files: Optional[Dict[str, IO]] = None,
         stream: bool = False,
-        data: Optional[Dict[str, Any]] = None,
+        data: Optional[Union[Dict[str, Any], PydanticBaseModel]] = None,
         is_login: bool = False,
         is_absolute_url: bool = False,
         custom_headers: Optional[Dict[str, str]] = None,
-        _is_retry_after_relogin: bool = False
+        _is_retry_after_relogin: bool = False,
+        model: Optional[Type[PydanticBaseModel]] = None,
+        many: Optional[bool] = None,
+        raw: bool = False
     ) -> requests.Response:
         """
         Makes a REST API call with retry logic for transient failures.
         """
         last_exception = None
         retryable_exceptions = (ConnectionError, requests.exceptions.Timeout, requests.exceptions.ConnectionError)
-        
+
         for attempt in range(self.max_retries):
             try:
                 return self.make_rest_call(
                     path, method, json_data, query_params, files, stream, data,
-                    is_login, is_absolute_url, custom_headers, _is_retry_after_relogin
+                    is_login, is_absolute_url, custom_headers, _is_retry_after_relogin,
+                    model, many, raw
                 )
             except retryable_exceptions as e:
                 last_exception = e
                 if attempt < self.max_retries - 1:  # Don't sleep on the last attempt
                     wait_time = self.retry_backoff_factor * (2 ** attempt)
-                    logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {e}. "
+                    logger.warning(f"Request failed (attempt {attempt + 1}/{self.max_retries}): {scrub_exception_message(e, query_params)}. "
                                  f"Retrying in {wait_time:.1f} seconds...")
                     time.sleep(wait_time)
                 else:
@@ -411,7 +492,7 @@ class HammerspaceApiClient:
                 if attempt < self.max_retries - 1 and e.status_code and e.status_code >= 500:
                     # Retry on server errors
                     wait_time = self.retry_backoff_factor * (2 ** attempt)
-                    logger.warning(f"Server error (attempt {attempt + 1}/{self.max_retries}): {e}. "
+                    logger.warning(f"Server error (attempt {attempt + 1}/{self.max_retries}): {scrub_exception_message(e, query_params)}. "
                                  f"Retrying in {wait_time:.1f} seconds...")
                     time.sleep(wait_time)
                 else:
@@ -421,30 +502,37 @@ class HammerspaceApiClient:
         self,
         path: str,
         method: str = "GET",
-        json_data: Optional[Dict[str, Any]] = None,
+        json_data: Optional[Union[Dict[str, Any], List[Any], PydanticBaseModel]] = None,
         query_params: Optional[Dict[str, Any]] = None,
         files: Optional[Dict[str, IO]] = None,
         stream: bool = False,
-        data: Optional[Dict[str, Any]] = None,
+        data: Optional[Union[Dict[str, Any], PydanticBaseModel]] = None,
         is_login: bool = False, # True if this call IS the login attempt
         is_absolute_url: bool = False,
         custom_headers: Optional[Dict[str, str]] = None,
-        _is_retry_after_relogin: bool = False # Internal flag
+        _is_retry_after_relogin: bool = False, # Internal flag
+        model: Optional[Type[PydanticBaseModel]] = None,
+        many: Optional[bool] = None,
+        raw: bool = False
     ) -> requests.Response:
         """
         Makes a REST API call. Handles session expiration and re-login.
         'path' can be a relative path or a full URL if is_absolute_url is True.
+
+        ``json_data``/``data`` may be pydantic models; they are serialized with
+        camelCase aliases before sending. ``model`` is only used to type the
+        parsed body stored in the GET response cache.
         """
         # Apply rate limiting
         self._check_rate_limit()
-        
+
         # Check cache for GET requests
         if method == "GET" and not is_login and not _is_retry_after_relogin and not is_absolute_url:
             cache_key = self._get_cache_key(path, method, query_params)
             cached_response = self._get_from_cache(cache_key)
             if cached_response is not None:
                 return cached_response
-        
+
         # Lazy login: if credentials exist, not a login call itself, not a retry, and we don't think we're logged in
         if self.username and self.password and \
            not is_login and \
@@ -456,6 +544,11 @@ class HammerspaceApiClient:
             except Exception as login_err:
                 logger.error(f"Pre-call login attempt failed: {login_err}. Cannot proceed with the original request {method} {path}.")
                 raise login_err
+
+        if isinstance(json_data, (PydanticBaseModel, list)):
+            json_data = serialize_body(json_data)
+        if isinstance(data, PydanticBaseModel):
+            data = serialize_body(data)
 
         if is_absolute_url:
             url = path
@@ -471,8 +564,8 @@ class HammerspaceApiClient:
             request_headers.update(custom_headers)
 
         logger.debug(
-            f"Request: {method} {url} Params: {query_params} JSON: {json_data is not None} "
-            f"Data: {data is not None} Files: {files is not None} Headers: {request_headers} "
+            f"Request: {method} {url} Params: {redact_params(query_params)} JSON: {json_data is not None} "
+            f"Data: {data is not None} Files: {files is not None} Headers: {redact_params(request_headers)} "
             f"IsLoginCall: {is_login} IsRetry: {_is_retry_after_relogin}"
         )
 
@@ -509,7 +602,7 @@ class HammerspaceApiClient:
             # Cache successful GET requests
             if method == "GET" and not is_login and not _is_retry_after_relogin and not is_absolute_url:
                 cache_key = self._get_cache_key(path, method, query_params)
-                response_data = self.read_and_parse_json_body(response)
+                response_data = self.read_and_parse_json_body(response, model=model, many=many, raw=raw)
                 if response_data is not None:
                     self._set_cache(cache_key, response_data)
                 return response  # Return original response
@@ -531,10 +624,13 @@ class HammerspaceApiClient:
                     logger.info("Re-login successful. Retrying original request.")
                     return self.make_rest_call(
                         path, method, json_data, query_params, files, stream, data,
-                        is_login=False, 
+                        is_login=False,
                         is_absolute_url=is_absolute_url,
                         custom_headers=custom_headers,
-                        _is_retry_after_relogin=True
+                        _is_retry_after_relogin=True,
+                        model=model,
+                        many=many,
+                        raw=raw
                     )
                 except Exception as relogin_exc: 
                     logger.error(
@@ -623,38 +719,117 @@ class HammerspaceApiClient:
                 raise ConnectionError(f"Request exception for {method} {url}: {e}", e)
   
 
-    def read_and_parse_json_body(self, response: Union[requests.Response, Dict[str, Any], List[Any]]) -> Optional[Union[Dict[str, Any], List[Any]]]:
+    @staticmethod
+    def _validate_model(model: Type[PydanticBaseModel], data: Any) -> PydanticBaseModel:
+        try:
+            return model.model_validate(data)
+        except PydanticValidationError as exc:
+            raise ValidationError(
+                f"Response failed {model.__name__} validation: "
+                f"{exc.error_count()} error(s): {exc}",
+                validation_errors=exc.errors(include_url=False),
+            ) from exc
+
+    def read_and_parse_json_body(
+        self,
+        response: Union[requests.Response, Dict[str, Any], List[Any]],
+        model: Optional[Type[PydanticBaseModel]] = None,
+        many: Optional[bool] = None,
+        raw: bool = False,
+    ) -> Optional[Union[PydanticBaseModel, List[PydanticBaseModel], Dict[str, Any], List[Any]]]:
+        """Parse a response body, optionally into a pydantic model.
+
+        When ``model`` is given (and neither the client's ``return_raw`` toggle
+        nor the per-call ``raw`` flag is set), the parsed JSON is validated into
+        ``model``: a list body becomes a list of models, a dict body a single
+        model. ``many`` forces list/single handling; by default the body shape
+        decides. Without ``model``, behaves exactly as before raw parsing.
+        """
         # Tolerate already-parsed bodies (e.g. values returned from the GET cache).
         if isinstance(response, (dict, list)):
-            return response
-        if response.status_code == 204: return None
-        if not response.content: return None # No content to parse
-        content_type = response.headers.get('Content-Type', '')
-        if not content_type.startswith('application/json'):
-            logger.warning(f"Response content type is '{content_type}', not 'application/json'. Body: {response.text[:200]}")
-            # Depending on strictness, you might want to return None or raise an error here
-            # For now, we'll still try to parse, as some APIs might not set content-type correctly.
+            parsed: Any = response
+        elif response.status_code == 204:
+            return None
+        elif not response.content:
+            return None
+        else:
+            content_type = response.headers.get('Content-Type', '')
+            if not content_type.startswith('application/json'):
+                logger.warning(f"Response content type is '{content_type}', not 'application/json'. Body: {response.text[:200]}")
+                # Depending on strictness, you might want to return None or raise an error here
+                # For now, we'll still try to parse, as some APIs might not set content-type correctly.
+            try:
+                parsed = response.json()
+            except requests.exceptions.JSONDecodeError as e: # More specific exception
+                logger.error(f"Failed to parse JSON response: {e} - Response text: {response.text[:500]}")
+                return None # Or raise an error if strict parsing is required
+
+        if model is None or self.return_raw or raw:
+            return parsed
+
+        as_many = many if many is not None else isinstance(parsed, list)
+        if as_many:
+            if not isinstance(parsed, list):
+                parsed = [parsed]
+            return [self._validate_model(model, item) for item in parsed]
+        if not isinstance(parsed, dict):
+            raise HammerspaceApiError(
+                f"Expected a single JSON object for {model.__name__}, "
+                f"got {type(parsed).__name__}"
+            )
+        return self._validate_model(model, parsed)
+
+    def _maybe_model_result(
+        self,
+        data: Any,
+        result_model: Optional[Type[PydanticBaseModel]],
+        raw: bool,
+    ) -> Any:
+        """Validate a task result into ``result_model`` when one is given.
+
+        Without an explicit ``result_model`` the raw parsed data is returned so
+        existing callers keep their dict contract; ``return_raw``/``raw`` always
+        wins.
+        """
+        if result_model is None or self.return_raw or raw or not isinstance(data, dict):
+            return data
         try:
-            return response.json()
-        except requests.exceptions.JSONDecodeError as e: # More specific exception
-            logger.error(f"Failed to parse JSON response: {e} - Response text: {response.text[:500]}")
-            return None # Or raise an error if strict parsing is required
+            return result_model.model_validate(data)
+        except PydanticValidationError as exc:
+            logger.warning(
+                f"Task result did not fit {result_model.__name__} "
+                f"({exc.error_count()} error(s)); returning raw data."
+            )
+            return data
 
     def execute_and_monitor_task(
         self,
         path: str,
         method: str = "POST",
-        initial_json_data: Optional[Dict[str, Any]] = None,
+        initial_json_data: Optional[Union[Dict[str, Any], List[Any], PydanticBaseModel]] = None,
         initial_query_params: Optional[Dict[str, Any]] = None,
         initial_headers: Optional[Dict[str, str]] = None,
         monitor_task: bool = True,
         task_timeout_seconds: int = 300,
-        poll_interval_seconds: int = 5
-    ) -> Union[Optional[str], Optional[Dict[str, Any]], Optional[List[Any]]]:
+        poll_interval_seconds: int = 5,
+        status_model: Optional[Type[PydanticBaseModel]] = None,
+        result_model: Optional[Type[PydanticBaseModel]] = None,
+        raw: bool = False
+    ) -> Any:
         """
         Executes an API call. If a 202 Accepted is received with a Location header,
         it monitors the task at that Location. Otherwise, handles synchronous responses.
+
+        Unless ``return_raw``/``raw`` is set, polls are parsed into ``status_model``
+        (default ``TaskStatus``) and, when ``result_model`` is given, the result
+        payload is validated into it; without ``result_model`` the raw parsed
+        data is returned, preserving the historical dict contract. Bodies
+        passed to ``monitor_task=False`` and 202-without-Location responses are
+        returned as raw parsed JSON.
         """
+        use_models = not (self.return_raw or raw)
+        if status_model is None and use_models:
+            status_model = TaskStatus
         try:
             initial_response = self.make_rest_call_with_retry(
                 path,
@@ -671,11 +846,11 @@ class HammerspaceApiClient:
 
         if not monitor_task:
             logger.debug("Task monitoring disabled. Returning initial response data.")
-            return initial_response_data
+            return self._maybe_model_result(initial_response_data, result_model, raw)
 
         if initial_response.status_code in [200, 201]: # Synchronous success
             logger.info(f"Synchronous success ({initial_response.status_code}). Returning initial response data.")
-            return initial_response_data
+            return self._maybe_model_result(initial_response_data, result_model, raw)
 
         if initial_response.status_code == 202: # Task initiated
             location_url = initial_response.headers.get('Location')
@@ -686,7 +861,6 @@ class HammerspaceApiClient:
 
             logger.info(f"Task initiated (202 Accepted). Monitoring Location URL: {location_url}")
             start_time = time.time()
-            last_known_status_data = None # To store the last successfully fetched task status
 
             while (time.time() - start_time) < task_timeout_seconds:
                 logger.debug(f"Polling task status at: {location_url}")
@@ -698,18 +872,33 @@ class HammerspaceApiClient:
                         is_absolute_url=True
                     )
                     current_task_data = self.read_and_parse_json_body(task_status_response)
-                    last_known_status_data = current_task_data # Update last known status
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"Polling request failed for {location_url}: {e}. Retrying in {poll_interval_seconds}s...")
                     time.sleep(poll_interval_seconds)
                     continue # Retry polling
 
-                if current_task_data and isinstance(current_task_data, dict):
+                task_state = ""
+                progress: Any = "N/A"
+                if status_model is not None and isinstance(current_task_data, dict):
+                    try:
+                        status = status_model.model_validate(current_task_data)
+                        task_state = getattr(status, "effective_state", "") or ""
+                        progress = getattr(status, "progress_percent", None) or "N/A"
+                    except PydanticValidationError as exc:
+                        logger.debug(
+                            f"Task status at {location_url} did not fit "
+                            f"{status_model.__name__} ({exc.error_count()} error(s)); "
+                            "falling back to raw status parsing."
+                        )
+                        task_state = ""
+
+                if task_state == "" and isinstance(current_task_data, dict):
+                    # Fallback for different status key names
                     task_state = current_task_data.get('state', current_task_data.get('status', '')).upper()
-                    if not task_state: # Fallback for different status key names
+                    if not task_state:
                         task_state = current_task_data.get('statusMessage', '').upper()
-                    
-                    progress = current_task_data.get("progressPercent", "N/A")
+
+                if isinstance(current_task_data, dict):
                     logger.info(f"Task at {location_url} - State: {task_state}, Progress: {progress}%")
 
                     if task_state == "COMPLETED":
@@ -727,15 +916,15 @@ class HammerspaceApiClient:
                                     try: # Robust parsing for "uuid=value" format
                                         entity_uuid = entity_uoid_val.split("uuid=")[1].split(",")[0].split("]")[0].strip()
                                     except IndexError: pass # Parsing failed, uuid remains None
-                            
+
                             if entity_uuid:
                                 logger.info(f"Task completed, extracted entity UUID: {entity_uuid}")
-                        return result_data # Return the result part or the whole task data
-                    
+                        return self._maybe_model_result(result_data, result_model, raw)
+
                     elif task_state in ["FAILED", "CANCELLED", "TIMED_OUT"]:
                         error_message = current_task_data.get("errorMessage", "Task failed, was cancelled, or timed out.")
                         logger.error(f"Task at {location_url} ended. State: {task_state}. Message: {error_message}")
-                        
+
                         # Import TaskFailedError to raise specific exception
                         from .exceptions import TaskFailedError
                         raise TaskFailedError(
@@ -745,11 +934,11 @@ class HammerspaceApiClient:
                         )
                 else:
                     logger.warning(f"Task data not found or not a dictionary while polling {location_url}. Retrying in {poll_interval_seconds}s...")
-                
+
                 time.sleep(poll_interval_seconds)
 
             logger.warning(f"Task monitoring for {location_url} timed out after {task_timeout_seconds} seconds.")
-            
+
             # Import TaskTimeoutError to raise specific exception
             from .exceptions import TaskTimeoutError
             raise TaskTimeoutError(

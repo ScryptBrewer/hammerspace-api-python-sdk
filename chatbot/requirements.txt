@@ -1,0 +1,4 @@
+crewai>=0.86.0
+python-dotenv>=1.0.0
+pydantic>=2.5
+requests>=2.20.0

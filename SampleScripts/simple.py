@@ -23,7 +23,7 @@ share_data = {
                 "exportOptions": [{"subnet": "192.168.2.0/23", "accessPermissions": "RW", "rootSquash": False, "insecure": False}],
             }
 
-result = client.shares.create_share(
+result = client.shares.create(
     share_data=share_data,
     monitor_task=True,
     task_timeout_seconds=600

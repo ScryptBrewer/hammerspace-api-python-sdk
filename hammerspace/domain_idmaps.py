@@ -9,7 +9,7 @@ class DomainIdmapsClient:
     def __init__(self, api_client: Any):
         self.api_client = api_client
 
-    def get(identifier: Optional[str] = None, **kwargs) -> Optional[List[Dict[str, Any]]]:
+    def get(self, identifier: Optional[str] = None, **kwargs) -> Optional[List[Dict[str, Any]]]:
         """
         Get all LDAP ID maps. (GET /domain-idmaps)
         Operation ID: listDomainIdmaps
@@ -17,7 +17,7 @@ class DomainIdmapsClient:
         query_params = {}
         if identifier:
             path = f"/domain-idmaps/{identifier}" 
-            logger.warning( f"get_share by id: Attempting GET from '{path}'. ")
+            logger.warning( f"get_domain_idmap by id: Attempting GET from '{path}'. ")
             # If GET /domain-idmaps/{id} has query params, process kwargs here
         else:
             path = "/domain-idmaps"

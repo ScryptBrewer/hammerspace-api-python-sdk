@@ -51,7 +51,7 @@ def main():
             logger.info(f"Attempting to create share with data: {share_data}")
 
             # Simpler call if no extra query params are needed beyond the body
-            result = client.shares.create_share(
+            result = client.shares.create(
                 share_data=share_data,
                 monitor_task=True, # Set to False if you know it's always synchronous (200 OK)
                 task_timeout_seconds=600
