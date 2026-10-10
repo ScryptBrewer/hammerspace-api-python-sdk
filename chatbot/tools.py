@@ -213,10 +213,9 @@ def _gen(tag: str):
 
 
 def _cluster_info() -> str:
-    client = _get_client()
-    info = {"system": client.system_info.get(raw=True)}
+    info = {"system": _gen("system-info").list(raw=True)}
     try:
-        info["local_site"] = client.generated.sites.get_local(raw=True)
+        info["local_site"] = _gen("sites").get_local(raw=True)
     except Exception as exc:
         info["local_site"] = _fail(exc)
     return _ok(info)
@@ -407,7 +406,7 @@ def _api_call(tag: str, method: str, args_json: str = "{}", confirm: bool = Fals
             if not n.startswith("_")
         ]
         return f"[error] unknown method {method!r} on {tag!r}; known: {methods}"
-    mutating = "monitor_task" in inspect.signature(fn).parameters
+    mutating = "execute_and_monitor_task" in inspect.getsource(fn)
     if mutating and not confirm:
         return REFUSAL
     try:
