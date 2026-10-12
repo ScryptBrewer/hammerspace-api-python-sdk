@@ -4,6 +4,19 @@
 
 The Hammerspace Python API Client is a comprehensive library that provides programmatic access to the Hammerspace data management platform. This client enables automation of various administrative tasks, configuration management, and operational workflows within a Hammerspace environment.
 
+The repository also includes **Gratto**, a local AI chatbot (CrewAI + Gradio web UI) that can inspect and fully manage a Hammerspace cluster through natural language, powered by the SDK. See [Gratto Chatbot](#gratto-chatbot-web-ui--cli) below.
+
+## Repository Contents
+
+| Path | Description |
+|------|-------------|
+| `hammerspace/` | The SDK: hand-written module clients plus typed Pydantic models and auto-generated per-tag clients (`hammerspace/generated/`, 69 modules / 373 operations) |
+| `hammerspace/models/` | Pydantic v2 models generated from the OpenAPI spec, with `to_api()` round-tripping |
+| `tools/` | Code generators (`generate_models.py`, `generate_clients.py`) that rebuild the typed layer from `Hammerspace_5_3_swagger.json` |
+| `tests/` | Pytest suite covering the classic clients, generated clients, models, and redaction |
+| `chatbot/` | Gratto: Gradio web UI (`app.py`), chat backend service (`backend.py`), CrewAI CLI (`bot.py`), cluster tools (`tools.py`), provider registry (`providers.py`) |
+| `.env.example` | Single template for all configuration (SDK + chatbot) — copy to `.env` |
+
 ## Basic Setup and Configuration
 
 ### Installation
@@ -53,6 +66,15 @@ Adds the linting, formatting, type-checking, and testing tooling
 pip install -e ".[dev]"
 ```
 
+#### Install with chatbot dependencies
+
+Installs CrewAI, Gradio, and everything the Gratto chatbot needs
+(Python 3.10-3.12 recommended — CrewAI does not yet support 3.13+):
+
+```bash
+pip install -e ".[chatbot]"
+```
+
 #### Build a wheel for offline installation
 
 Build a redistributable wheel from the local source, then install it
@@ -60,8 +82,8 @@ Build a redistributable wheel from the local source, then install it
 
 ```bash
 python -m pip install build
-python -m build            # produces dist/hammerspace_api_client-0.1.0-py3-none-any.whl
-pip install dist/hammerspace_api_client-0.1.0-py3-none-any.whl
+python -m build            # produces dist/hammerspace_api_client-1.1.0-py3-none-any.whl
+pip install dist/hammerspace_api_client-1.1.0-py3-none-any.whl
 ```
 
 #### Verify the installation
@@ -70,13 +92,21 @@ pip install dist/hammerspace_api_client-0.1.0-py3-none-any.whl
 python -c "import hammerspace; print(hammerspace.__version__)"
 ```
 
-You should see the installed version (e.g. `0.1.0`) printed with no errors.
+You should see the installed version (e.g. `1.1.0`) printed with no errors.
 
 ## Basic Configuration
 
-The client reads its connection details from environment variables (or a local
-`.env` file) rather than hardcoded values. Copy `.env.example` to `.env` and fill
-in your values — `HS_BASE_URL`, `HS_USERNAME`, `HS_PASSWORD`, and `VERIFY_SSL`.
+Everything is configured from **one file**: copy `.env.example` (repo root) to
+`.env` and fill in your values. The same `.env` serves the SDK, the CLI bot,
+and the Gradio web UI:
+
+- `HS_BASE_URL`, `HS_USERNAME`, `HS_PASSWORD`, `VERIFY_SSL` — the Hammerspace
+  appliance (SDK client and chatbot cluster tools)
+- `OPENAI_API_KEY`, `GROQ_API_KEY`, ... — one LLM provider key for the chatbot
+  (optional; only needed for the chatbot)
+
+Both the SDK (`hammerspace/client.py`) and the chatbot (`chatbot/backend.py`)
+load this `.env` automatically, no matter which directory you run from.
 
 ```python
 from hammerspace.client import HammerspaceApiClient
@@ -118,6 +148,68 @@ new_share = shares.create(
 )
 print(f"Created new share: {new_share}")
 ```
+
+## Gratto Chatbot (Web UI + CLI)
+
+Gratto is a local AI assistant for your Hammerspace cluster, built on
+[CrewAI](https://github.com/crewAIInc/crewAI) with a Gradio web interface and
+an optional CLI. It talks to any OpenAI-compatible provider — OpenAI,
+Perplexity, Groq, Together, Mistral, DeepSeek, OpenRouter, Ollama (fully
+local), or a custom endpoint — and drives the cluster through 29 tools built
+on the generated SDK:
+
+- **Shares**: create, update, delete, move; list/get
+- **Objectives (SLAs)**: create, delete; list
+- **Storage volumes**: add, remove; list
+- **Volume groups**: create, delete; list
+- **Users**: create, delete, set password; list
+- **Sites (global namespace)**: add remote site, remove site; list
+- **Snapshots**: create, restore, delete; list per share
+- **Cluster**: system info, nodes, tasks
+- **`api_call`**: escape hatch to *any* of the 373 generated SDK operations
+  (licenses, network, DNS, NTP, KMS, IdP, syslog, software update, ...)
+
+### Safety guardrails
+
+- Every destructive operation (delete/restore/move/site pairing) refuses to
+  run unless the tool is called with `confirm=true` — the assistant asks for
+  your confirmation in chat first.
+- Read-only mode strips all write tools entirely.
+- After each write the assistant checks the cluster task result via
+  `get_tasks`.
+
+### Setup
+
+```bash
+python3.11 -m venv .venv-chatbot          # CrewAI supports Python 3.10-3.12
+source .venv-chatbot/bin/activate
+pip install -r chatbot/requirements.txt
+pip install -e .                          # provides the hammerspace SDK
+
+cp .env.example .env                      # repo root — ONE .env for everything
+# fill in HS_BASE_URL / HS_USERNAME / HS_PASSWORD and one LLM provider key
+```
+
+### Web UI (recommended)
+
+```bash
+python chatbot/app.py        # open http://127.0.0.1:7860
+```
+
+Use the **Settings** tab to pick provider/model/key, temperature, and the
+Hammerspace connection (or read-only mode), then **Start assistant**. Chat in
+the **Chat** tab. Set `GRADIO_SERVER_PORT` to change the port.
+
+### CLI
+
+```bash
+python chatbot/bot.py --provider groq --hammerspace             # full management
+python chatbot/bot.py --provider groq --hammerspace --read-only # inspection only
+python chatbot/bot.py --provider ollama                          # 100% local chat
+python chatbot/bot.py --list-providers                           # providers + key status
+```
+
+See `chatbot/README.md` for the full chatbot documentation.
 
 ## Modules and Functions
 The Hammerspace API client is organized into multiple modules, each providing specific functionality. Below is a comprehensive list of all modules and their functions:

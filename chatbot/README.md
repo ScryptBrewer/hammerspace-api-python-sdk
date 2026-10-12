@@ -14,7 +14,7 @@ source .venv-chatbot/bin/activate
 pip install -r chatbot/requirements.txt
 pip install -e .                          # only needed for --hammerspace tools
 
-cp chatbot/.env.example .env              # then fill in one API key
+cp .env.example .env                      # repo root; one .env for SDK + chatbot
 ```
 
 ## Choose a provider (API token target)
@@ -32,6 +32,23 @@ cp chatbot/.env.example .env              # then fill in one API key
 | custom     | `CUSTOM_LLM_*`      | —             | any OpenAI-compatible endpoint |
 
 ## Run
+
+### Web UI (Gradio)
+
+```bash
+python chatbot/app.py        # open http://127.0.0.1:7860
+```
+
+The **Settings** tab picks the provider, model, API key, temperature, and the
+Hammerspace connection (or read-only mode); **Start assistant** builds the
+agent. The **Chat** tab is the conversation — destructive operations still
+require explicit confirmation in chat. Set `GRADIO_SERVER_PORT` to change the
+port.
+
+Architecture: `app.py` (Gradio UI) → `backend.py` (`ChatService`: provider →
+LLM → agent → reply) → `tools.py` (29 cluster tools) → the generated SDK.
+
+### CLI
 
 ```bash
 python chatbot/bot.py                          # interactive provider picker

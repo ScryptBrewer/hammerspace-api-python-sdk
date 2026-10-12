@@ -50,6 +50,7 @@ dev = [
 ]
 chatbot = [
     "crewai>=0.86.0",
+    "gradio>=5.0",
 ]
 docs = [
     "sphinx>=7.0.0",
